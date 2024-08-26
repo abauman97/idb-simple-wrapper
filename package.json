@@ -1,0 +1,24 @@
+{
+  "name": "idb-simple-wrapper",
+  "version": "1.0.0",
+  "description": "Simple wrapper around indexeddb allowing for async/await, easier database connection and management, and full typescript support",
+  "main": "index.js",
+  "scripts": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abauman97/idb-simple-wrapper.git"
+  },
+  "keywords": [
+    "indexeddb",
+    "typescript",
+    "javascript"
+  ],
+  "author": "Austin Bauman",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/abauman97/idb-simple-wrapper/issues"
+  },
+  "homepage": "https://github.com/abauman97/idb-simple-wrapper#readme"
+}

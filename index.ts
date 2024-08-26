@@ -174,7 +174,7 @@ export class StoreModel<RecordT extends Object> {
       };
       dbReq.onsuccess = () => {
         if (!initialized) {
-          bgSyncData();
+          initialized = true;
         } else {
           initialized = true;
         }
@@ -317,3 +317,5 @@ export class StoreModel<RecordT extends Object> {
     });
   }
 }
+
+module.exports = { dbConfig, allStores, StoreModel };
