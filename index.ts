@@ -151,7 +151,7 @@ export class StoreModel<RecordT extends Object> {
     return returnValue;
   }
 
-  async openDB(): Promise<IDBDatabase> {
+  private async openDB(): Promise<IDBDatabase> {
     return new Promise((resolve, reject) => {
       const dbReq = indexedDB.open(dbConfig.name, versionNbr);
       dbReq.onerror = (e) => reject(`IndexedDB error event: ${e.target}`);
