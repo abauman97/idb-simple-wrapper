@@ -1,33 +1,25 @@
 /**
  * IndexedDB wrapper for defining typed stores and working with them.
  */
-type LocalDBCallback<RecordT extends Object> = {
-  event: "select" | "selectMany" | "insert" | "update" | "delete";
-  data: RecordT | RecordT[];
-};
-type StoreDefinition<RecordT extends Object> = {
-  storeName: string;
-  /**Define all top level fields in each record and apply options. Set null
-   * if field doesn't need any special settings.
-   */
-  fields: Record<
-    keyof RecordT,
-    {
-      primaryKey?: boolean;
-      preventIndex?: boolean;
-      isDateString?: boolean;
-    } | null
-  >;
-  version?: number;
-  onCallback?: (event: LocalDBCallback<RecordT>) => any;
-  /**Functions that modify records coming in and out of indexedDB.
-   * Most used to convert dates represented as strings or Date ojects to numbers
-   * for use in index searches.
-   */
-  transform?: {
-    in: (record: RecordT) => Record<keyof RecordT, any>;
-    out: (record: Record<keyof RecordT, any>) => RecordT;
-  };
+
+/**Interface that a FieldTransformer object should implement to properly convert data types
+ * to and from indexedDB storage.
+ *
+ * Ex: converting a date to a string for storage and back to a Date for use in js
+ */
+export interface FieldTransformer<T> {
+  toJSON(field: T): any;
+  fromJSON(field: any): T;
+}
+
+export const DateTransformer: FieldTransformer<Date> = {
+  toJSON(field: Date) {
+    return field.toJSON();
+  },
+
+  fromJSON(field: string): Date {
+    return new Date(field);
+  },
 };
 
 export let dbConfig = {
@@ -37,60 +29,8 @@ export let dbConfig = {
   /**Validate store only. No data will be seeded. Used for testing */
   validateOnly: false,
 };
-export let allStores: StoreDefinition<any>[] = [];
 let versionNbr = 0;
 let initialized = false; // True once stores are all initialized and worker should be registered
-
-function getKeyFields<RecordT extends Object>(store: StoreDefinition<RecordT>) {
-  let dateFieldKeys: (keyof RecordT)[] = [];
-  let primaryKey: keyof RecordT | (keyof RecordT)[] | undefined = undefined;
-  let indexes: (keyof RecordT)[] = [];
-  const fields = Object.entries(store.fields);
-  fields.forEach((field) => {
-    const name = field[0] as keyof RecordT;
-    const fieldConfig = field[1];
-    // Validate field names can be indexed
-    const invalidChars = field[0].match("[^a-zA-Z0-9_]+$");
-    if (invalidChars && !fieldConfig?.preventIndex) {
-      throw new Error(
-        `Invalid field name: ${field[0]}. Names being indexed may only include alphanumeric characters (A-Z, a-z, 0-9) and underscores (_)`
-      );
-    }
-    if (fieldConfig?.primaryKey) {
-      // This field is marked as a primary key
-      // If primary key already exists, make composite primary key
-      const pkType = typeof primaryKey;
-      switch (pkType) {
-        case "string":
-          const pk = primaryKey;
-          primaryKey = [pk as keyof RecordT, name];
-          break;
-        case "undefined":
-          primaryKey = name;
-          break;
-        default:
-          if (primaryKey!.constructor === Array) {
-            primaryKey.push(name);
-          }
-      }
-    }
-    fieldConfig?.isDateString ? dateFieldKeys.push(name) : undefined;
-    if (!(fieldConfig?.preventIndex || fieldConfig?.primaryKey)) {
-      indexes.push(name);
-    }
-  });
-  if (!primaryKey) {
-    throw new Error(`No primary key defined on store ${store.storeName}"`);
-  }
-  const primary: keyof RecordT | (keyof RecordT)[] = primaryKey;
-  if (Array.isArray(primary)) {
-    // Index primary key fields if composite primary keys
-    // @ts-ignore
-    primary.forEach((k) => indexes.push(k));
-    indexes.push();
-  }
-  return { primary, indexes, dateFieldKeys };
-}
 
 async function deleteDB() {
   return new Promise((resolve, reject) => {
@@ -104,50 +44,116 @@ async function deleteDB() {
   });
 }
 
+let allStores: {
+  storeName: string;
+  indexes: string[];
+  primaryKey: string | string[];
+}[] = [];
+
 export class StoreModel<RecordT extends Object> {
   // All  return promises if they’re async
-  private store: StoreDefinition<RecordT>;
-  private dateFieldKeys: (keyof RecordT)[] = [];
+  private storeConfig: {
+    storeName: string;
+    fields: Record<
+      keyof RecordT,
+      {
+        primaryKey?: boolean;
+        preventIndex?: boolean;
+        typeTransformer?: FieldTransformer<any>;
+      } | null
+    >;
+    version?: number;
+  };
   private primaryKey: keyof RecordT | (keyof RecordT)[] | undefined = undefined;
   private indexes: (keyof RecordT)[] = [];
+  private transformFields: (keyof RecordT)[] = []; // Fields with defined transformer class
 
-  constructor(store: StoreDefinition<RecordT>) {
-    allStores.push(store);
-    versionNbr += (store.version ?? 0) + 1;
-    this.store = store;
-    const keyFields = getKeyFields(store);
-    this.dateFieldKeys = keyFields.dateFieldKeys;
-    this.primaryKey = keyFields.primary;
-    this.indexes = keyFields.indexes;
+  constructor(storeConfig: typeof this.storeConfig) {
+    this.storeConfig = storeConfig;
+    this.getKeyFields();
+    allStores.push({
+      storeName: this.storeConfig.storeName,
+      indexes: this.indexes as string[],
+      primaryKey: this.primaryKey as string | string[],
+    });
+    versionNbr += (this.storeConfig.version ?? 0) + 1;
     console.debug(
-      `${store.storeName} init complete. primaryKey: `,
+      `${this.storeConfig.storeName} init complete. primaryKey: `,
       this.primaryKey,
       ", indexes: ",
-      this.indexes,
-      ", dateFields: ",
-      this.dateFieldKeys
+      this.indexes
     );
+  }
+
+  /**Parse the key fields and set store settings for them */
+  private getKeyFields() {
+    const fields = Object.entries(this.storeConfig.fields);
+    fields.forEach((field) => {
+      const name = field[0] as keyof RecordT;
+      const fieldConfig = field[1];
+      // Validate field names can be indexed
+      const invalidChars = field[0].match("[^a-zA-Z0-9_]+$");
+      if (invalidChars && !fieldConfig?.preventIndex) {
+        throw new Error(
+          `Invalid field name: ${field[0]}. Names being indexed may only include alphanumeric characters (A-Z, a-z, 0-9) and underscores (_)`
+        );
+      }
+      if (fieldConfig?.primaryKey) {
+        // This field is marked as a primary key
+        // If primary key already exists, make composite primary key
+        const pkType = typeof this.primaryKey;
+        switch (pkType) {
+          case "string":
+            const pk = this.primaryKey;
+            this.primaryKey = [pk as keyof RecordT, name];
+            break;
+          case "undefined":
+            this.primaryKey = name;
+            break;
+          default:
+            if (this.primaryKey!.constructor === Array) {
+              this.primaryKey.push(name);
+            }
+        }
+      }
+      fieldConfig?.typeTransformer
+        ? this.transformFields.push(name)
+        : undefined;
+      if (!(fieldConfig?.preventIndex || fieldConfig?.primaryKey)) {
+        this.indexes.push(name);
+      }
+    });
+    if (!this.primaryKey) {
+      throw new Error(
+        `No primary key defined on store ${this.storeConfig.storeName}"`
+      );
+    }
+    if (Array.isArray(this.primaryKey)) {
+      // Index primary key fields if composite primary keys
+      this.primaryKey.forEach((k) => this.indexes.push(k));
+    }
   }
 
   private valueToStorage(value: RecordT) {
     let returnValue: Record<keyof RecordT, any> = value;
-    if (this.store.transform) {
-      returnValue = this.store.transform.in(value);
+    if (!this.transformFields) {
+      return value;
     }
-    this.dateFieldKeys.forEach((k) => {
-      returnValue[k] = new Date(returnValue[k] as string);
+    this.transformFields.forEach((k) => {
+      const transformer = this.storeConfig.fields[k]!.typeTransformer!;
+      returnValue[k] = transformer.toJSON(returnValue[k]);
     });
     return returnValue;
   }
   private valueFromStorage(value: Record<keyof RecordT, any>) {
-    let returnValue: RecordT = value;
-    this.dateFieldKeys.forEach((k) => {
-      const dateField: Date = value[k];
-      returnValue[k] = dateField.toJSON() as RecordT[keyof RecordT];
-    });
-    if (this.store.transform) {
-      returnValue = this.store.transform.out(returnValue);
+    let returnValue = value;
+    if (!this.transformFields) {
+      return returnValue;
     }
+    this.transformFields.forEach((k) => {
+      const transformer = this.storeConfig.fields[k]!.typeTransformer!;
+      returnValue[k] = transformer.fromJSON(returnValue[k]);
+    });
     return returnValue;
   }
 
@@ -157,17 +163,15 @@ export class StoreModel<RecordT extends Object> {
       dbReq.onerror = (e) => reject(`IndexedDB error event: ${e.target}`);
       dbReq.onupgradeneeded = () => {
         const db = dbReq.result;
-        // storesNeedingSeedData = [];
         allStores.forEach(async (store) => {
           if (db.objectStoreNames.contains(store.storeName)) {
             // Delete store if it exists to recreate it with latest schema on upgrade
             db.deleteObjectStore(store.storeName);
           }
-          const keys = getKeyFields(store);
           const newStore = db.createObjectStore(store.storeName, {
-            keyPath: keys.primary as string | string[],
+            keyPath: store.primaryKey as string | string[],
           });
-          keys.indexes.forEach((idx) => {
+          store.indexes.forEach((idx) => {
             newStore.createIndex(idx as string, idx as string);
           });
         });
@@ -198,8 +202,8 @@ export class StoreModel<RecordT extends Object> {
   ): Promise<RecordT | undefined> {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.store.storeName, "readonly");
-      const os = tx.objectStore(this.store.storeName);
+      const tx = db.transaction(this.storeConfig.storeName, "readonly");
+      const os = tx.objectStore(this.storeConfig.storeName);
       let index: IDBObjectStore | IDBIndex = os;
       if (indexName) {
         index = os.index(indexName as string);
@@ -208,9 +212,6 @@ export class StoreModel<RecordT extends Object> {
       request.onsuccess = () => {
         const result = this.valueFromStorage(request.result);
         tx.commit();
-        if (this.store.onCallback) {
-          this.store.onCallback({ event: "select", data: result });
-        }
         resolve(result);
       };
       request.onerror = (e) => {
@@ -227,8 +228,8 @@ export class StoreModel<RecordT extends Object> {
     console.time("selectManyTimer");
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.store.storeName, "readonly");
-      const os = tx.objectStore(this.store.storeName);
+      const tx = db.transaction(this.storeConfig.storeName, "readonly");
+      const os = tx.objectStore(this.storeConfig.storeName);
       let index: IDBObjectStore | IDBIndex = os;
       if (options?.index) {
         index = os.index(options.index as string);
@@ -238,7 +239,7 @@ export class StoreModel<RecordT extends Object> {
       let result: RecordT[] = [];
       request.onsuccess = () => {
         idbRecords = request.result;
-        if (this.store.transform) {
+        if (this.transformFields) {
           idbRecords.forEach((r) => {
             result.push(this.valueFromStorage(r));
           });
@@ -246,9 +247,6 @@ export class StoreModel<RecordT extends Object> {
           result = idbRecords;
         }
         tx.commit();
-        if (this.store.onCallback) {
-          this.store.onCallback({ event: "selectMany", data: result });
-        }
         console.timeEnd("selectManyTimer");
         resolve(result);
       };
@@ -261,14 +259,11 @@ export class StoreModel<RecordT extends Object> {
   async insert(value: RecordT) {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.store.storeName, "readwrite");
-      const os = tx.objectStore(this.store.storeName);
+      const tx = db.transaction(this.storeConfig.storeName, "readwrite");
+      const os = tx.objectStore(this.storeConfig.storeName);
       const valueIn = this.valueToStorage(value);
       const request = os.add(valueIn);
       request.onsuccess = () => {
-        if (this.store.onCallback) {
-          this.store.onCallback({ event: "insert", data: valueIn });
-        }
         tx.commit();
         resolve(undefined);
       };
@@ -281,14 +276,11 @@ export class StoreModel<RecordT extends Object> {
   async update(value: RecordT) {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.store.storeName, "readwrite");
-      const os = tx.objectStore(this.store.storeName);
+      const tx = db.transaction(this.storeConfig.storeName, "readwrite");
+      const os = tx.objectStore(this.storeConfig.storeName);
       const valueIn = this.valueToStorage(value);
       const request = os.put(valueIn);
       request.onsuccess = () => {
-        if (this.store.onCallback) {
-          this.store.onCallback({ event: "update", data: valueIn });
-        }
         tx.commit();
         resolve(undefined);
       };
@@ -301,13 +293,10 @@ export class StoreModel<RecordT extends Object> {
   async delete(key: IDBValidKey | IDBKeyRange) {
     const db = await this.getDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(this.store.storeName, "readwrite");
-      const os = tx.objectStore(this.store.storeName);
+      const tx = db.transaction(this.storeConfig.storeName, "readwrite");
+      const os = tx.objectStore(this.storeConfig.storeName);
       const request = os.delete(key);
       request.onsuccess = () => {
-        if (this.store.onCallback) {
-          this.store.onCallback({ event: "delete", data: [] });
-        }
         tx.commit();
         resolve(undefined);
       };
@@ -318,4 +307,5 @@ export class StoreModel<RecordT extends Object> {
   }
 }
 
+/**@ts-ignore */
 module.exports = { dbConfig, allStores, StoreModel };
